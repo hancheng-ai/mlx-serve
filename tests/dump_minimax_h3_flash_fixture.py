@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""HyperFlow H3 Flash parity fixture: one stable-diffusion.cpp DiT call, in mlx-serve's packed-row layout.
+
+The reference is stable-diffusion.cpp with Video Rebirth's `hyperflow-two-time.patch`, built with a tensor dump in
+`MiniMaxH3Runner::compute` (`-DSD_H3_DUMP`: `SD_H3_DUMP_DIR` gets call `SD_H3_DUMP_CALL`'s inputs and output as raw
+float32, shapes in `meta.txt`, ggml order). This turns that dump into the inputs and expected outputs of
+`minimax h3 flash parity` in `src/plugins/minimax_h3/h3.zig`:
+
+    video_rows [T*H/2*W/2, C*2*2]   the noisy video latent as patch rows
+    audio_rows [2*L, 32]            the noisy audio latent (sd.cpp's carrier undone) as channel-major rows
+    context    [text, 5120]         the text encoder's states, before the DiT's refiner
+    video_v / audio_v               the step direction d(x)/d(sigma) each stream takes, audio on its own clock
+    meta                            sigma, sigma_next, latent T, H, W, audio L, frame count
+
+Usage: uv run --with numpy --with safetensors tests/dump_minimax_h3_flash_fixture.py <dump dir> <fixture.safetensors>
+"""
+
+import sys
+
+import numpy as np
+from safetensors.numpy import save_file
+
+VIDEO_SHIFT, AUDIO_SHIFT = 12.0, 3.0
+
+
+def shift(sigma, from_shift, to_shift):
+    base = sigma / (from_shift + sigma * (1.0 - from_shift))
+    return to_shift * base / (1.0 + (to_shift - 1.0) * base)
+
+
+def main():
+    src, dst = sys.argv[1], sys.argv[2]
+    shapes = {}
+    for line in open(f"{src}/meta.txt"):
+        name, *dims = line.split()
+        shapes[name] = [int(d) for d in dims]
+    raw = {n: np.fromfile(f"{src}/{n}.bin", dtype=np.float32) for n in ("x", "timestep", "context", "scalars", "out")}
+    audio_len, vshift, ashift, sigma_next = raw["scalars"].tolist()
+    if (vshift, ashift) != (VIDEO_SHIFT, AUDIO_SHIFT):
+        raise SystemExit(f"shifts {vshift}/{ashift} are not H3's 12/3")
+    audio_len = int(audio_len)
+    # The packed latent is [W, H, T, channels] in ggml order: 24 video channels, then the audio carrier and padding.
+    w, h, t = shapes["x"][:3]
+    c = 24
+    sigma = min(max(float(raw["timestep"][0]) / 1000.0, 1e-6), 1.0)
+    sigma_a = shift(sigma, VIDEO_SHIFT, AUDIO_SHIFT)
+    k = VIDEO_SHIFT / AUDIO_SHIFT
+    nv = c * t * h * w
+    na = 32 * 2 * audio_len
+
+    def video_rows(flat):
+        v = flat[:nv].reshape(c, t, h // 2, 2, w // 2, 2)
+        return np.ascontiguousarray(v.transpose(1, 2, 4, 0, 3, 5).reshape(t * (h // 2) * (w // 2), c * 4))
+
+    def audio_rows(flat):
+        a = flat[nv:nv + na].reshape(32, 2, audio_len)
+        return np.ascontiguousarray(a.transpose(1, 2, 0).reshape(2 * audio_len, 32))
+
+    # sd.cpp samples the audio as the carrier c_a = (sigma_v / sigma_a) x_a and returns d(c_a)/d(sigma_v):
+    # (1 - k) x_a + (1 + (k - 1) sigma_a) v_a.
+    x_a = audio_rows(raw["x"]) * (sigma_a / sigma)
+    v_a = (audio_rows(raw["out"]) - (1.0 - k) * x_a) / (1.0 + (k - 1.0) * sigma_a)
+    ctx_w = shapes["context"][0]
+    out = {
+        "video_rows": video_rows(raw["x"]),
+        "audio_rows": x_a.astype(np.float32),
+        "context": np.ascontiguousarray(raw["context"].reshape(-1, ctx_w)),
+        "video_v": video_rows(raw["out"]),
+        "audio_v": v_a.astype(np.float32),
+        "meta": np.array([sigma, sigma_next, t, h, w, audio_len, (t - 2) // 5 * 17 + 5], dtype=np.float32),
+    }
+    save_file(out, dst)
+    for n, a in out.items():
+        print(n, a.shape, float(np.abs(a).mean()))
+
+
+if __name__ == "__main__":
+    main()

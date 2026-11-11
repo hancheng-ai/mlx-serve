@@ -11,6 +11,8 @@ float32, shapes in `meta.txt`, ggml order). This turns that dump into the inputs
     context    [text, 5120]         the text encoder's states, before the DiT's refiner
     video_v / audio_v               the step direction d(x)/d(sigma) each stream takes, audio on its own clock
     meta                            sigma, sigma_next, latent T, H, W, audio L, frame count
+    cond_rows / keyframes           FL2VA only: the keyframe latents as fed (patch rows) and their anchors (0 first, 1 last)
+    text_tags                       only when the prompt is not all text: each text row's modality tag
 
 Usage: uv run --with numpy --with safetensors tests/dump_minimax_h3_flash_fixture.py <dump dir> <fixture.safetensors>
 """
@@ -69,6 +71,22 @@ def main():
         "audio_v": v_a.astype(np.float32),
         "meta": np.array([sigma, sigma_next, t, h, w, audio_len, (t - 2) // 5 * 17 + 5], dtype=np.float32),
     }
+    # FL2VA keyframes: each condition latent ([W, H, T, 24] in ggml order) as patch rows, and its anchor (0 first, 1 last).
+    conds = sorted((n for n in shapes if n.startswith("cond")), key=lambda n: int(n[4:]))
+    if conds:
+        rows = []
+        for n in conds:
+            cw, ch, ct, cc = shapes[n][:4]
+            v = np.fromfile(f"{src}/{n}.bin", dtype=np.float32).reshape(cc, ct, ch // 2, 2, cw // 2, 2)
+            rows.append(v.transpose(1, 2, 4, 0, 3, 5).reshape(ct * (ch // 2) * (cw // 2), cc * 4))
+        out["cond_rows"] = np.ascontiguousarray(np.concatenate(rows))
+        kf = np.fromfile(f"{src}/keyframes.bin", dtype=np.int32) if "keyframes" in shapes else np.arange(len(conds))
+        out["keyframes"] = (kf != 0).astype(np.float32)
+    # The prompt's AdaLN modality per text row: sd.cpp splices the keyframes into the prompt as vision rows (tag 0).
+    if "tags" in shapes:
+        tags = np.fromfile(f"{src}/tags.bin", dtype=np.int32)
+        if np.any(tags != 1):
+            out["text_tags"] = tags.astype(np.float32)
     save_file(out, dst)
     for n, a in out.items():
         print(n, a.shape, float(np.abs(a).mean()))

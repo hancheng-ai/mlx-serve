@@ -63,6 +63,13 @@ Usage:
         --src <VideoRebirthAI/hyperflow-h3-flash>/ref2va_gguf/minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf \
         --reuse-from ~/.mlx-serve/models/ddalcu/MiniMax-H3-REF2VA-MLX-Serve-8bit \
         --out ~/.mlx-serve/models/ddalcu/HyperFlow-H3-Flash-REF2VA-MLX-Serve-8bit
+
+    # HyperFlow H3 Flash FL2VA (first/last keyframes): the same, from fl2va_gguf/
+    uv run --with mlx --with numpy --with gguf tests/convert_minimax_h3_weights.py \
+        --partition flash-fl2va \
+        --src <VideoRebirthAI/hyperflow-h3-flash>/fl2va_gguf/minimax_h3_fl2va_hyperflow_flash_14b-Q8_0.gguf \
+        --reuse-from ~/.mlx-serve/models/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit \
+        --out ~/.mlx-serve/models/ddalcu/HyperFlow-H3-Flash-FL2VA-MLX-Serve-8bit
 """
 
 import argparse
@@ -345,10 +352,23 @@ PARTITIONS = {
                   "GGUF's zero rank padding to multiples of 64, and the schedule and two-time gate "
                   "moved into `config.json`. The text encoder, VAEs and tokenizer are cloned from the `--reuse-from` H3 pack (the VAEs are byte-identical to the release's).\n"),
     },
+    "flash-fl2va": {
+        "dit_file": None,
+        "tasks": ["t2va", "fl2va"],
+        "upstream": "VideoRebirthAI/hyperflow-h3-flash (fl2va_gguf, Q8_0)",
+        "base_model": "VideoRebirthAI/hyperflow-h3-flash",
+        "title": "HyperFlow H3 Flash FL2VA",
+        "blurb": ("Video Rebirth's compressed few-step derivative of MiniMax-H3 FL2VA: three of 50 "
+                  "blocks dropped, 102 linears low-rank factored, conditioned on the step's two "
+                  "times (t, r). Text-to-audio-video with optional first/last keyframes, 4, 6 "
+                  "(default) or 8 steps without guidance."),
+    },
 }
+PARTITIONS["flash-fl2va"]["extra"] = PARTITIONS["flash-ref2va"]["extra"]
 
-# Video Rebirth's REF2VA compression: the base block it removed (the GGUF numbers the rest 0..48).
-FLASH_DROPPED = {"flash-ref2va": [9]}
+# Video Rebirth's compression: the base blocks it removed (the GGUF numbers the rest from 0).
+FLASH_DROPPED = {"flash-ref2va": [9], "flash-fl2va": [6, 21, 22]}
+BASE_LAYERS = 50
 
 CONFIG = {
     "model_type": "minimax_h3",
@@ -504,6 +524,9 @@ def main():
         if not args.reuse_from:
             raise SystemExit("--reuse-from is required: Flash ships only its DiT")
         flash = FlashGguf(src)
+        if flash.layers != BASE_LAYERS - len(FLASH_DROPPED[args.partition]):
+            raise SystemExit(f"GGUF has {flash.layers} blocks; {args.partition} drops "
+                             f"{FLASH_DROPPED[args.partition]} of {BASE_LAYERS}: wrong partition's GGUF?")
         CONFIG["transformer"].update(num_layers=flash.layers, time_embed_dim=flash.time_embed_dim)
         CONFIG["two_time"] = {"gate": flash.gate, "default_steps": 6, "sigma_grids": FLASH_GRIDS}
         CONFIG["dropped_blocks"] = FLASH_DROPPED[args.partition]

@@ -7595,6 +7595,26 @@ test "minimax h3: a two-time plan keys rows by (t, r), so video and audio stay a
     try testing.expectEqual(@as(usize, 2), q.n_unique);
 }
 
+test "minimax h3: a two-time FL2VA plan holds both keyframes at r == t over the whole trained grid" {
+    const a = testing.allocator;
+    var l = try PackedLayout.init(a, 64, 5, 8, 12, 17, &.{ .first, .last }, 17);
+    defer l.deinit();
+    const grid = [_]f64{ 1.0, 0.825217, 0.471725, 0.147401, 0.049626, 0.015517, 0.0 };
+    const sigmas = try gridSchedule(a, &grid, 12.0);
+    defer a.free(sigmas);
+    for (0..grid.len - 1) |i| {
+        var p = try buildTimestepPlan(a, &l, sigmas[i], 12.0, 3.0, .{ .endpoint = sigmas[i + 1] });
+        defer p.deinit();
+        const video = p.unique_t[p.runs[l.segments.len - 1].mod_row / 3];
+        try testing.expectApproxEqAbs(1.0 - sigmas[i + 1], video.r, 1e-12);
+        for (l.segments, p.runs) |seg, run| if (seg.kind == .cond) {
+            const c = p.unique_t[run.mod_row / 3];
+            try testing.expectEqual(c.t, c.r);
+            try testing.expectEqual(@max(1.0 - sigmas[i], VISUAL_COND_TIMESTEP), c.t);
+        };
+    }
+}
+
 test "minimax h3: a two-time schedule table holds every step's pairs and each step finds its own" {
     const a = testing.allocator;
     var l = try PackedLayout.init(a, 4, 2, 4, 4, 3, &.{}, 5);
@@ -7773,8 +7793,40 @@ test "minimax h3 flash parity: one DiT forward matches the stable-diffusion.cpp 
     defer a.free(dit);
     var model = try loadDit(a, dit, g.dit, .bfloat16, s);
     defer model.deinit();
-    var layout = try PackedLayout.init(a, @intCast(mlx.getShape(ctx)[0]), lt, lh, lw, at, &.{}, frames);
+    // An FL2VA fixture carries its keyframes: `cond_rows` (their patch rows, as fed) and `keyframes` (0 = first, 1 = last).
+    var anchors: [2]KeyframeAnchor = undefined;
+    var n_kf: usize = 0;
+    if (fw.get("keyframes") != null) {
+        const kf_a = try ownWeight(&fw, "keyframes");
+        defer _ = mlx.mlx_array_free(kf_a);
+        const kf = try copyArrayF32(a, kf_a, s);
+        defer a.free(kf);
+        for (kf) |k| {
+            anchors[n_kf] = if (k == 0) .first else .last;
+            n_kf += 1;
+        }
+    }
+    const video_in = if (n_kf > 0) blk: {
+        const cond = try ownWeight(&fw, "cond_rows");
+        defer _ = mlx.mlx_array_free(cond);
+        break :blk try concat(&[_]mlx.mlx_array{ cond, video_rows }, 0, s);
+    } else video_rows;
+    defer if (n_kf > 0) {
+        _ = mlx.mlx_array_free(video_in);
+    };
+    var layout = try PackedLayout.init(a, @intCast(mlx.getShape(ctx)[0]), lt, lh, lw, at, anchors[0..n_kf], frames);
     defer layout.deinit();
+    var tags: []u8 = &.{};
+    defer a.free(tags);
+    if (fw.get("text_tags") != null) {
+        const tags_a = try ownWeight(&fw, "text_tags");
+        defer _ = mlx.mlx_array_free(tags_a);
+        const t32 = try copyArrayF32(a, tags_a, s);
+        defer a.free(t32);
+        tags = try a.alloc(u8, t32.len);
+        for (t32, tags) |x, *t| t.* = @intFromFloat(x);
+        layout.text_tags = tags;
+    }
     var plan = try buildTimestepPlan(a, &layout, sigma, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{ .endpoint = next });
     defer plan.deinit();
     const refined = try model.refineText(ctx, s);
@@ -7782,7 +7834,7 @@ test "minimax h3 flash parity: one DiT forward matches the stable-diffusion.cpp 
     var rope = try buildRope(a, &layout, model.inv_freq, .bfloat16, s);
     defer rope.deinit();
     const slope = timeShiftSlope(sigma, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO);
-    var out = try model.forward(&layout, &plan, refined, video_rows, audio_rows, rope, model.ownHeads(), slope, null, true, s);
+    var out = try model.forward(&layout, &plan, refined, video_in, audio_rows, rope, model.ownHeads(), slope, null, true, s);
     defer out.deinit();
     // Both return the sampler's direction (sd.cpp's flow output); ours carries the audio clock slope on top.
     for ([_]struct { name: []const u8, got: mlx.mlx_array, scale: f32 }{

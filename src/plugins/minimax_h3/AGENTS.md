@@ -5,7 +5,8 @@ joint audio/video flow DiT, a transformer video VAE decoder (24 fps) and an audi
 the pack's declared `tasks` (the ONLY discriminator; the files are identical): FL2VA (keyframes, chained windows),
 REF2VA (references), FastH3 Omni (REF2VA's 8-step PDD student with trained VSA sparse attention). Packs:
 `ddalcu/MiniMax-H3-MLX-Serve-{4bit,8bit}`, converter `tests/convert_minimax_h3_weights.py`. HyperFlow H3 Flash
-(`--partition flash-ref2va`, from its Q8_0 GGUF) is a two-time DiT: blocks dropped, low-rank linears, `two_time` schedule.
+(`--partition flash-ref2va` / `flash-fl2va`, from its Q8_0 GGUFs) is a two-time DiT: blocks dropped, low-rank linears,
+`two_time` schedule; its keyframe and reference rows stay at r == t.
 
 ## Files
 - `plugin.zig`: the media table (request parse, keyframes, references, residency plan, the clip as JSON members), the

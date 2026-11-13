@@ -36,6 +36,37 @@ const mage_flow = @import("../mage_flow/mage_flow.zig");
 const lora_mod = @import("../../sdk/weights/lora.zig");
 const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
 const int8_attn = @import("../../sdk/blocks/dit/int8_attn.zig");
+const h3_env = @import("../../env.zig");
+
+/// The DiT block a loader is converting (null: the token refiner), read by `keepPacked`.
+var load_block: ?u32 = null;
+
+/// `MINIMAX_H3_W8A8_PACKED=<kind>,..,<a>-<b>` (ablation): under `--w8a8` these DiT linears keep their packed
+/// weights. Kinds qkv, out, gate, fc1, fc2 (none listed: all); block ranges inclusive (none listed: all blocks).
+fn keepPacked(kind: []const u8) bool {
+    const raw = std.mem.span(h3_env.get(.MINIMAX_H3_W8A8_PACKED) orelse return false);
+    if (raw.len == 0) return false;
+    const blk = load_block orelse return false;
+    var any_kind = false;
+    var kind_hit = false;
+    var any_range = false;
+    var range_hit = false;
+    var it = std.mem.tokenizeScalar(u8, raw, ',');
+    while (it.next()) |t| {
+        if (std.mem.indexOfScalar(u8, t, '-')) |d| {
+            any_range = true;
+            const lo = std.fmt.parseInt(u32, t[0..d], 10) catch continue;
+            const hi = std.fmt.parseInt(u32, t[d + 1 ..], 10) catch continue;
+            if (blk >= lo and blk <= hi) range_hit = true;
+        } else {
+            any_kind = true;
+            if (std.mem.eql(u8, t, kind)) kind_hit = true;
+        }
+    }
+    const keep = (!any_kind or kind_hit) and (!any_range or range_hit);
+    if (keep) log.info("[minimax-h3] w8a8 ablation: block {d} {s} stays packed\n", .{ blk, kind });
+    return keep;
+}
 const h3_glue = @import("glue.zig");
 const h3_split = @import("cluster.zig");
 const h3_vsa = @import("vsa.zig");
@@ -1166,9 +1197,9 @@ const AttnW = struct {
         defer a.free(gate_w);
         if (w.get(gate_w) != null) r.gate = try MfLinear.load(w, a, gate_p, cfg.hidden_size, dt, s);
         if (!ane.aneState().media_offload.video) { // the ANE seam reads the packed weights
-            try r.qkv.toW8a8(s);
-            try r.out.toW8a8(s);
-            if (r.gate) |*g| try g.toW8a8(s);
+            if (!keepPacked("qkv")) try r.qkv.toW8a8(s);
+            if (!keepPacked("out")) try r.out.toW8a8(s);
+            if (r.gate) |*g| if (!keepPacked("gate")) try g.toW8a8(s);
         }
         return r;
     }
@@ -1198,8 +1229,8 @@ const MlpW = struct {
         };
         errdefer r.deinit();
         if (!ane.aneState().media_offload.video) {
-            try r.fc1.toW8a8(s);
-            try r.fc2.toW8a8(s);
+            if (!keepPacked("fc1")) try r.fc1.toW8a8(s);
+            if (!keepPacked("fc2")) try r.fc2.toW8a8(s);
         }
         return r;
     }
@@ -1416,6 +1447,8 @@ const BlockW = struct {
         defer a.free(mlp_p);
         const adaln_p = try std.fmt.allocPrint(a, "{s}.adaln_proj", .{pfx});
         defer a.free(adaln_p);
+        load_block = idx;
+        defer load_block = null;
         var r: BlockW = .{
             .norm1 = try ownWeightAs(w, a, pfx, ".norm1.weight", dt, s),
             .norm2 = try ownWeightAs(w, a, pfx, ".norm2.weight", dt, s),
